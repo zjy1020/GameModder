@@ -1,0 +1,26 @@
+# 打包产物
+dist/
+build/
+.build/
+*.spec
+
+# 运行生成的配置/数据
+modder_config.json
+user_templates.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 调试脚本
+.tmp/
+
+# 内部工作记录 (AI 助手工作日志, 不对外)
+.workbuddy/
+
+# 废弃版本
+ScritchyModder.py
+
+# 系统
+Thumbs.db
+.DS_Store
