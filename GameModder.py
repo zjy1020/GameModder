@@ -381,6 +381,28 @@ def parse_number(text):
     return float(t)
 
 
+def parse_range(text):
+    """解析范围文本 'min~max' (分隔符 ~ 或 -), 两端支持单位缩写。
+    例: '1M~1.01M' -> (1000000.0, 1010000.0), '1000-1200' -> (1000.0, 1200.0)。
+    不是范围/解析失败返回 None (调用方走精确扫描)。'-1M' 不会被误判 (前段为空)。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for sep in ("~", "-"):
+        if sep in t:
+            parts = [p.strip() for p in t.split(sep)]
+            if len(parts) == 2:
+                try:
+                    a = parse_number(parts[0])
+                    b = parse_number(parts[1])
+                    if a == b:
+                        return None          # 区间退化 -> 精确值
+                    return (min(a, b), max(a, b))
+                except ValueError:
+                    pass
+    return None
+
+
 # ============================================================
 # 内存引擎
 # ============================================================
@@ -555,6 +577,49 @@ class MemoryScanner:
             if not full and len(hits) >= max_hits:
                 break
         return hits
+
+    def scan_range(self, vmin, vmax, vtype, progress_cb=None, cancel_evt=None,
+                   max_hits=200000):
+        """区间扫描: 匹配值在 [vmin, vmax] 内的所有对齐位置 (解决显示四舍五入/挂机增长,
+        输入 1M 但实际是 1000002 扫不到的问题)。
+        按类型对齐过滤, 区间不含 0 时跳过全零段; 返回 [(addr, 实际值字节)]。
+        """
+        _, _, size, fmt = TYPE_KEY[vtype]
+        align = 8 if vtype in ("double", "int64") else (4 if vtype in ("float", "int32") else 1)
+        results = []
+        total = self.total_bytes
+        done = 0
+        skip_zero = not (vmin <= 0 <= vmax)
+        for base, rsize in self.regions:
+            if cancel_evt and cancel_evt.is_set():
+                break
+            buf = ctypes.create_string_buffer(rsize)
+            n = ctypes.c_size_t(0)
+            ok = ReadProcessMemory(self.handle, ctypes.c_void_p(base),
+                                   buf, rsize, ctypes.byref(n))
+            if ok and n.value >= size:
+                data = buf.raw[:n.value]
+                dlen = len(data)
+                # 整块全零且区间不含 0: 直接跳过 (大部分内存是全零, 大幅加速)
+                if skip_zero and not data.strip(b"\x00"):
+                    done += rsize
+                    continue
+                first = (-base) % align          # 首对齐偏移
+                for pos in range(first, dlen - size + 1, align):
+                    try:
+                        v = struct.unpack_from(fmt, data, pos)[0]
+                    except struct.error:
+                        break
+                    if vmin <= v <= vmax:
+                        results.append((base + pos, data[pos:pos + size]))
+                        if len(results) >= max_hits:
+                            break
+            done += rsize
+            if progress_cb:
+                progress_cb(done, total)
+            if len(results) >= max_hits:
+                break
+        return results
 
     def scan_template(self, value, vtype, verifies, progress_cb=None, cancel_evt=None,
                       max_hits=500, max_checks=8000000, align=1):
@@ -1125,10 +1190,10 @@ class GameModderGUI:
         row1 = ttk.Frame(f)
         row1.pack(fill="x", pady=2)
         ttk.Label(row1, text="扫描值:").pack(side="left")
-        self.scan_value = ttk.Entry(row1, width=12, font=FONT_MONO)
+        self.scan_value = ttk.Entry(row1, width=14, font=FONT_MONO)
         self.scan_value.pack(side="left", padx=4)
         self.scan_value.insert(0, "0")
-        ttk.Label(row1, text="(支持 1K/1M/1B/1T 缩写, 如 2.3M=2300000)",
+        ttk.Label(row1, text="(支持 1K/1M/1B/1T 缩写; 范围如 1M~1.01M 扫区间)",
                   foreground="#888", font=FONT_S).pack(side="left", padx=(0, 8))
         ttk.Label(row1, text="类型:").pack(side="left")
         self.scan_type = ttk.Combobox(row1, width=28, state="readonly", font=FONT)
@@ -1377,14 +1442,20 @@ class GameModderGUI:
             pass
 
     # ---------- 扫描 ----------
-    def _scan_worker(self, action, val, vtype):
+    def _scan_worker(self, action, val, vtype, rng=None):
         self.cancel_evt.clear()
         try:
             if action == "first":
                 self.scanner.scan_vtype = vtype
-                self.log("首次扫描: %s (%s, 全量) ..." % (val, vtype))
-                hits = self.scanner.scan_exact(val, vtype, self._prog_cb, self.cancel_evt,
-                                               full=True)
+                if rng:
+                    vmin, vmax = rng
+                    self.log("范围扫描: %.6g ~ %.6g (%s, 全量) ..." % (vmin, vmax, vtype))
+                    hits = self.scanner.scan_range(vmin, vmax, vtype,
+                                                   self._prog_cb, self.cancel_evt)
+                else:
+                    self.log("首次扫描: %s (%s, 全量) ..." % (val, vtype))
+                    hits = self.scanner.scan_exact(val, vtype, self._prog_cb, self.cancel_evt,
+                                                   full=True)
                 self.scanner.candidates = hits
             elif action == "equal":
                 if not vtype:
@@ -1415,6 +1486,7 @@ class GameModderGUI:
         if not self._require_pid():
             return
         val = None
+        rng = None
         vtype = None
         try:
             if action == "first":
@@ -1422,7 +1494,9 @@ class GameModderGUI:
                 if not vtype:
                     self.log("请先选择类型 — 推荐点 [自动识别类型], 或手动从下拉框选一个")
                     return
-                val = self.parse_val(self.scan_value.get(), vtype)
+                text = self.scan_value.get()
+                rng = parse_range(text)         # 范围语法 (如 1M~1.01M)
+                val = self.parse_val(text, vtype) if rng is None else None
             elif action == "equal":
                 vtype = self.scanner.scan_vtype
                 if not vtype:
@@ -1432,7 +1506,8 @@ class GameModderGUI:
         except Exception as e:
             self.log("数值格式错误: %s" % e)
             return
-        threading.Thread(target=self._scan_worker, args=(action, val, vtype), daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(action, val, vtype, rng),
+                         daemon=True).start()
 
     # ---------- 自动识别类型 ----------
     def on_auto_detect(self):
