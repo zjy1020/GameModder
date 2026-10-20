@@ -354,7 +354,13 @@ TYPE_KEY = {t[1]: t for t in VALUE_TYPES}
 def pack_value(vtype, val):
     _, _, _, fmt = TYPE_KEY[vtype]
     if vtype in ("double", "float"):
-        return struct.pack(fmt, float(val))
+        try:
+            return struct.pack(fmt, float(val))
+        except OverflowError:
+            label = "float" if vtype == "float" else "double"
+            limit = "3.4e38" if vtype == "float" else "1.8e308"
+            raise ValueError("%s 类型上限约 %s, 输入值 %g 超了 — 换 double/int64 类型"
+                             % (label, limit, float(val)))
     return struct.pack(fmt, int(val))
 
 
@@ -363,16 +369,83 @@ def unpack_value(vtype, data):
     return struct.unpack(fmt, data[:size])[0]
 
 
+def short_float32(v):
+    """float32 的最短可往返十进制串: 找最短位数 p, 使按 p 位格式化后重新
+    打包回 float32 与原值位模式完全一致。422.72369384765625 -> '422.7237'
+    (用户照抄这个串去精确扫描, 必然命中)"""
+    try:
+        target = struct.unpack("<f", struct.pack("<f", v))[0]
+    except (OverflowError, struct.error, ValueError):
+        return "%.9g" % v
+    if target != target or target in (float("inf"), float("-inf")):
+        return "%.9g" % target
+    for p in range(1, 10):
+        s = "%.*g" % (p, target)
+        try:
+            if struct.unpack("<f", struct.pack("<f", float(s)))[0] == target:
+                return s
+        except (OverflowError, ValueError):
+            continue
+    return "%.9g" % target
+
+
+def short_repr(vtype, v):
+    """把值格式化为「最短且能精确还原」的十进制串。
+    double (Python float) 用 repr 的最短往返表示 (~17 位有效数字);
+    float 用 float32 最短往返 (~7 位有效数字); 整数类型直接十进制。"""
+    if vtype == "float":
+        return short_float32(v)
+    if vtype in ("int32", "int64"):
+        try:
+            return str(int(v))
+        except (TypeError, ValueError, OverflowError):
+            return str(v)
+    try:
+        return repr(float(v))
+    except (TypeError, ValueError):
+        return str(v)
+
+
 def fmt_value(vtype, data):
     try:
         v = unpack_value(vtype, data)
         if vtype in ("double", "float"):
-            if v == int(v) and abs(v) < 1e15:
-                return "%.1f" % v
-            return "%.6g" % v
+            if v != v or v in (float("inf"), float("-inf")):
+                return short_repr(vtype, v)          # nan / inf
+            if v == int(v) and abs(v) < 1e16:
+                return "%.1f" % v                    # 整数值显示为 12.0 更易读
+            return short_repr(vtype, v)              # 小数: 最短可往返串, 不再截到 6 位
         return str(v)
     except Exception:
         return "?"
+
+
+def decimals_of(text):
+    """用户输入的小数位数, 用于推算扫描容差。
+    '422.7237' -> 4, '1.2e-3' -> 4 (0.0012), '1.2e3' -> 0, '100' -> 0, '1.5K' -> 1。
+    尾部单位缩写 (k/m/b/t) 会先剥掉。"""
+    t = (text or "").strip().lower()
+    if t and t[-1] in "kmbt":
+        t = t[:-1].strip()
+    exp = 0
+    if "e" in t:
+        mant, _, es = t.partition("e")
+        try:
+            exp = int(es)
+        except ValueError:
+            exp = 0
+        t = mant
+    d = len(t.split(".", 1)[1]) if "." in t else 0
+    d -= exp
+    return max(0, min(d, 30))
+
+
+def half_step(decimals):
+    """输入 n 位小数时, 真值必然落在 [v-半格, v+半格) 内 —— 半格 = 0.5 * 10^-n。
+    精确扫描打不中时用它做容差重扫, 覆盖「界面只显示几位小数」的常见情况。"""
+    if decimals <= 0:
+        return 0.0
+    return 0.5 * (10.0 ** (-decimals))
 
 
 # 大数缩写显示/输入: 1K=千, 1M=百万, 1B=十亿, 1T=万亿
@@ -393,7 +466,7 @@ def fmt_abbrev(v):
             if abs(num - round(num)) < 1e-9:
                 return "%d%s" % (round(num), suf)
             return "%.1f%s" % (num, suf)
-    return "%.6g" % v
+    return repr(float(v))
 
 
 def parse_number(text):
@@ -753,9 +826,26 @@ class MemoryScanner:
         return self.read(addr, size)
 
     # ---------- 过滤 ----------
-    def filter_equal(self, new_value, vtype):
+    def filter_equal(self, new_value, vtype, tol=0.0):
+        """保留当前值 == new_value 的候选。tol>0 且浮点类型时按容差匹配
+        (覆盖「界面只显示几位小数, 真值精度更高」的情况)。"""
         pat = pack_value(vtype, new_value)
         keep = []
+        if tol > 0 and vtype in ("double", "float"):
+            lo, hi = float(new_value) - tol, float(new_value) + tol
+            for addr, _ in self.candidates:
+                cur = self._cur_bytes(addr, len(pat))
+                if cur is None:
+                    continue
+                try:
+                    v = struct.unpack(TYPE_KEY[vtype][3], cur)[0]
+                except (struct.error, TypeError):
+                    continue
+                if v != v:                  # nan 永不相等
+                    continue
+                if lo <= v <= hi:
+                    keep.append((addr, cur))
+            return keep
         for addr, _ in self.candidates:
             cur = self._cur_bytes(addr, len(pat))
             if cur is not None and cur == pat:
@@ -1566,7 +1656,7 @@ class GameModderGUI:
         self.scan_value = ttk.Entry(row1, width=14, font=FONT_MONO)
         self.scan_value.pack(side="left", padx=4)
         self.scan_value.insert(0, "0")
-        ttk.Label(row1, text="(支持 1K/1M/1B/1T 缩写; 范围如 1M~1.01M 扫区间)",
+        ttk.Label(row1, text="(可带小数, 位数不限; 支持 1K/1M/1B/1T; 范围如 1M~1.01M)",
                   foreground="#888", font=FONT_S).pack(side="left", padx=(0, 8))
         ttk.Label(row1, text="类型:").pack(side="left")
         self.scan_type = ttk.Combobox(row1, width=28, state="readonly", font=FONT)
@@ -1621,7 +1711,7 @@ class GameModderGUI:
         self.tree.heading("addr", text="地址 (16进制)")
         self.tree.heading("value", text="当前值")
         self.tree.column("addr", width=240, anchor="w")
-        self.tree.column("value", width=160, anchor="e")
+        self.tree.column("value", width=210, anchor="e")
         vsb = ttk.Scrollbar(f, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True, pady=4)
@@ -1775,7 +1865,8 @@ class GameModderGUI:
         v = self.scanner.read_value(addrs[0], self.scanner.scan_vtype or "double")
         if v is not None:
             self.ptr_newval.delete(0, "end")
-            self.ptr_newval.insert(0, ("%.6g" % v) if isinstance(v, float) else str(v))
+            self.ptr_newval.insert(0, short_repr(self.scanner.scan_vtype or "double", v)
+                                   if isinstance(v, float) else str(v))
         self.log("已取地址 0x%X (%s)" % (addrs[0], self.scanner.scan_vtype or "?"))
 
     def on_list_modules(self):
@@ -2112,12 +2203,15 @@ class GameModderGUI:
         return VALUE_TYPES[idx][1]
 
     def parse_val(self, text, vtype):
-        """解析用户输入的数值, 支持 1K/1M/1B/1T 缩写 (如 '2.3M' -> 2300000)"""
+        """解析用户输入的数值, 支持 1K/1M/1B/1T 缩写 (如 '2.3M' -> 2300000)。
+        整数类型对小数四舍五入 (输入 3.9 -> 4), 而不是截断成 3。"""
         text = text.strip()
         num = parse_number(text)
         if vtype in ("double", "float"):
             return num
-        return int(num)
+        if num != num:
+            raise ValueError("整数类型不接受 nan")
+        return int(round(num))
 
     # ---------- 进程 ----------
     def open_process_picker(self):
@@ -2169,26 +2263,38 @@ class GameModderGUI:
             pass
 
     # ---------- 扫描 ----------
-    def _scan_worker(self, action, val, vtype, rng=None):
+    def _scan_worker(self, action, val, vtype, rng=None, tol=0.0):
         self.cancel_evt.clear()
         try:
             if action == "first":
                 self.scanner.scan_vtype = vtype
                 if rng:
                     vmin, vmax = rng
-                    self.log("范围扫描: %.6g ~ %.6g (%s, 全量) ..." % (vmin, vmax, vtype))
+                    self.log("范围扫描: %s ~ %s (%s, 全量) ..." %
+                             (short_repr(vtype, vmin), short_repr(vtype, vmax), vtype))
                     hits = self.scanner.scan_range(vmin, vmax, vtype,
                                                    self._prog_cb, self.cancel_evt)
                 else:
-                    self.log("首次扫描: %s (%s, 全量) ..." % (val, vtype))
+                    self.log("首次扫描: %s (%s, 全量) ..." %
+                             (short_repr(vtype, val), vtype))
                     hits = self.scanner.scan_exact(val, vtype, self._prog_cb, self.cancel_evt,
                                                    full=True)
+                    if not hits and tol > 0:
+                        # 精确扫描 0 命中且用户输入带小数: 真值精度可能高于界面显示,
+                        # 自动按「半格」区间重扫 (输入 422.72 -> 扫 422.715~422.725)
+                        self.log("精确匹配 0 命中。按输入精度自动容差重扫: %s ~ %s ..." %
+                                 (short_repr(vtype, val - tol), short_repr(vtype, val + tol)))
+                        hits = self.scanner.scan_range(val - tol, val + tol, vtype,
+                                                       self._prog_cb, self.cancel_evt)
+                        if hits:
+                            self.log("容差扫描命中 %d 个 —— 内存真值的精度比界面显示更高,"
+                                     " 这些候选的当前值就是精确值。" % len(hits))
                 self.scanner.candidates = hits
             elif action == "equal":
                 if not vtype:
                     self.msg_queue.put(("error", "请先执行首次扫描"))
                     return
-                self.scanner.candidates = self.scanner.filter_equal(val, vtype)
+                self.scanner.candidates = self.scanner.filter_equal(val, vtype, tol)
             elif action == "changed":
                 self.scanner.candidates = self.scanner.filter_changed()
             elif action == "unchanged":
@@ -2215,6 +2321,7 @@ class GameModderGUI:
         val = None
         rng = None
         vtype = None
+        tol = 0.0
         try:
             if action == "first":
                 vtype = self.get_vtype(self.scan_type)
@@ -2223,17 +2330,23 @@ class GameModderGUI:
                     return
                 text = self.scan_value.get()
                 rng = parse_range(text)         # 范围语法 (如 1M~1.01M)
-                val = self.parse_val(text, vtype) if rng is None else None
+                if rng is None:
+                    val = self.parse_val(text, vtype)
+                    if vtype in ("double", "float"):
+                        tol = half_step(decimals_of(text))
             elif action == "equal":
                 vtype = self.scanner.scan_vtype
                 if not vtype:
                     self.log("请先执行首次扫描")
                     return
-                val = self.parse_val(self.scan_value.get(), vtype)
+                text = self.scan_value.get()
+                val = self.parse_val(text, vtype)
+                if vtype in ("double", "float"):
+                    tol = half_step(decimals_of(text))
         except Exception as e:
             self.log("数值格式错误: %s" % e)
             return
-        threading.Thread(target=self._scan_worker, args=(action, val, vtype, rng),
+        threading.Thread(target=self._scan_worker, args=(action, val, vtype, rng, tol),
                          daemon=True).start()
 
     # ---------- 自动识别类型 ----------
@@ -2250,10 +2363,11 @@ class GameModderGUI:
             self.log("数值格式错误, 请输入数字(如 33 或 33.5)")
             return
         self.progress["value"] = 0
+        tol = half_step(decimals_of(text))
         self.log("自动识别中: 依次扫描 double/float/int64/int32 (约 10~15 秒) ...")
-        threading.Thread(target=self._auto_detect_worker, args=(v,), daemon=True).start()
+        threading.Thread(target=self._auto_detect_worker, args=(v, tol), daemon=True).start()
 
-    def _auto_detect_worker(self, v):
+    def _auto_detect_worker(self, v, tol=0.0):
         try:
             results = {}
             order = ("double", "float", "int64", "int32")
@@ -2262,11 +2376,15 @@ class GameModderGUI:
                 def cb(done, total, _vt=vtype, _base=base):
                     if total > 0:
                         self.msg_queue.put(("progress", _base + int(done * 100 / total) // 4))
-                scan_v = v if vtype in ("double", "float") else int(v)
+                scan_v = v if vtype in ("double", "float") else int(round(v))
                 hits = self.scanner.scan_exact(scan_v, vtype, cb, self.cancel_evt, full=True)
+                if not hits and tol > 0 and vtype in ("double", "float"):
+                    # 界面显示精度不足时, 按半格容差补一遍, 否则浮点类型永远 0 命中
+                    hits = self.scanner.scan_range(v - tol, v + tol, vtype,
+                                                   cb, self.cancel_evt)
                 results[vtype] = (len(hits), len(hits) >= 50000)
             rec = self._pick_type(v, results)
-            self.msg_queue.put(("auto_done", (v, results, rec)))
+            self.msg_queue.put(("auto_done", (v, results, rec, tol)))
         except Exception as e:
             self.msg_queue.put(("error", "自动识别出错: %s" % e))
 
@@ -2334,15 +2452,34 @@ class GameModderGUI:
         total = len(self.scanner.candidates)
         if kw_addr or kw_val:
             # 两个搜索框独立匹配, 同时填时取交集 (全量过滤, 不受显示上限限制)
-            # 值匹配同时支持: 精确值 (如 2289737 / 2289737.0) 和缩写 (如 2.3M / 2m)
+            # 值匹配同时支持: 精确值 (如 2289737 / 2289737.0)、缩写 (如 2.3M)
+            # 和「按输入小数位数容差」(显示 422.72 能搜到内存里的 422.72369...)
+            kw_tol = 0.0
+            kw_num = None
+            if kw_val:
+                try:
+                    kw_num = parse_number(kw_val)
+                    kw_tol = half_step(decimals_of(kw_val))
+                except (ValueError, TypeError):
+                    kw_num = None
             matched = []
             for addr, data in self.scanner.candidates:
                 if kw_addr and kw_addr not in ("0x%X" % addr).lower():
                     continue
                 if kw_val:
-                    fv = fmt_value(vtype, data)
+                    fv = fmt_value(vtype, data).lower()
                     fa = fmt_abbrev(unpack_value(vtype, data)).lower()
-                    if kw_val not in fv.lower() and kw_val not in fa:
+                    ok = kw_val in fv or kw_val in fa
+                    if not ok and kw_num is not None:
+                        try:
+                            v = unpack_value(vtype, data)
+                        except Exception:
+                            v = None
+                        if isinstance(v, float) and v == v:
+                            ok = abs(v - kw_num) <= kw_tol
+                        elif isinstance(v, int):
+                            ok = v == int(round(kw_num))
+                    if not ok:
                         continue
                 matched.append((addr, data))
             src = matched
@@ -2848,8 +2985,9 @@ class GameModderGUI:
             self.log("读取失败 (0x%X)" % addr)
             return
         self.man_value.delete(0, "end")
-        self.man_value.insert(0, ("%.6g" % v) if vtype in ("double", "float") else str(v))
-        self.log("读取 0x%X (%s) = %s" % (addr, vtype, v))
+        self.man_value.insert(0, short_repr(vtype, v) if vtype in ("double", "float") else str(v))
+        self.log("读取 0x%X (%s) = %s" % (addr, vtype, short_repr(vtype, v)
+                                          if vtype in ("double", "float") else v))
 
     def on_man_write(self):
         if not self._require_pid():
@@ -2889,7 +3027,7 @@ class GameModderGUI:
                         self.log(payload)
                         self.progress["value"] = 0
                     elif kind == "auto_done":
-                        v, results, rec = payload
+                        v, results, rec, tol = payload
                         self.progress["value"] = 100
                         lines = []
                         for t in ("double", "float", "int64", "int32"):
@@ -2901,8 +3039,12 @@ class GameModderGUI:
                         idx = next((i for i, t in enumerate(TYPE_LABELS) if rec in t), 0)
                         self.scan_type.current(idx)
                         self.scanner.scan_vtype = rec
-                        scan_v = v if rec in ("double", "float") else int(v)
+                        scan_v = v if rec in ("double", "float") else int(round(v))
                         hits = self.scanner.scan_exact(scan_v, rec, full=True)
+                        if not hits and tol > 0 and rec in ("double", "float"):
+                            self.log("推荐的 %s 精确匹配 0 命中, 按输入精度容差重扫: %s ~ %s ..." %
+                                     (rec, short_repr(rec, v - tol), short_repr(rec, v + tol)))
+                            hits = self.scanner.scan_range(v - tol, v + tol, rec)
                         self.scanner.candidates = hits
                         self._render_candidates()
                         self.log("已按 %s 类型载入候选 %d 个, 可直接过滤/多轮收敛" % (rec, len(hits)))
@@ -2953,7 +3095,8 @@ class GameModderGUI:
                                 else:
                                     v = self.scanner.read_value(addr, self._ptr_vtype())
                                     val = "-" if v is None else (
-                                        "%.6g" % v if isinstance(v, float) else str(v))
+                                        short_repr(self._ptr_vtype(), v)
+                                        if isinstance(v, float) else str(v))
                                 self.chain_tree.insert("", "end", values=(path, val, note))
                             self.log("指针链回溯完成: 0x%X 得到 %d 条路径 "
                                      "(其中 %d 条落在模块内, 重启后仍有效)。" %

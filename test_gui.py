@@ -99,6 +99,29 @@ def main():
         print("       异常: %r" % (e,))
     check("ChainPicker 构建", ok)
 
+    print("\n[8] 候选搜索框支持显示精度不匹配")
+    # 内存里是真值 422.72369384765625, 用户只在搜索框里输 422.72 —— 旧版搜不到, 现在靠容差命中
+    app.scanner.scan_vtype = "double"
+    app.scanner.candidates = [
+        (0x1000, G.pack_value("double", 422.72369384765625)),
+        (0x2000, G.pack_value("double", 999.0)),
+    ]
+    app.addr_filter_var.set("")
+    app.val_filter_var.set("422.72")
+    app._render_candidates()
+    rows = app.tree.get_children()
+    check("422.72 能搜到 422.72369...", len(rows) == 1,
+          str([app.tree.item(r, "values") for r in rows]))
+    app.val_filter_var.set("999")
+    app._render_candidates()
+    check("整数值照常命中", len(app.tree.get_children()) == 1)
+    app.val_filter_var.set("422.9")
+    app._render_candidates()
+    check("差太远不误命中", len(app.tree.get_children()) == 0)
+    app.val_filter_var.set("")
+    app.scanner.candidates = []
+    app._render_candidates()
+
     root.destroy()
     print("\n" + "=" * 54)
     if fails:

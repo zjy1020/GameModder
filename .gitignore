@@ -29,3 +29,6 @@ ScritchyModder.py
 # 系统
 Thumbs.db
 .DS_Store
+
+# 临时探测脚本
+_t*.py
