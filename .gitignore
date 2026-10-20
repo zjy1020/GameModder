@@ -7,6 +7,11 @@ build/
 # 运行生成的配置/数据
 modder_config.json
 user_templates.json
+pointer_chains.json
+
+# 自测临时产物
+fixture.json
+fixture_out.txt
 
 # Python
 __pycache__/

@@ -118,6 +118,36 @@ IsWindowVisible = user32.IsWindowVisible
 IsWindowVisible.argtypes = [wintypes.HWND]
 IsWindowVisible.restype = wintypes.BOOL
 
+# ---------- 模块枚举 (psapi) ----------
+psapi = ctypes.WinDLL('psapi', use_last_error=True)
+
+LIST_MODULES_ALL = 0x03
+
+
+class MODULEINFO(ctypes.Structure):
+    _fields_ = [
+        ("lpBaseOfDll", ctypes.c_void_p),
+        ("SizeOfImage", wintypes.DWORD),
+        ("EntryPoint", ctypes.c_void_p),
+    ]
+
+
+EnumProcessModulesEx = psapi.EnumProcessModulesEx
+EnumProcessModulesEx.restype = wintypes.BOOL
+EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE),
+                                 wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                 wintypes.DWORD]
+
+GetModuleInformation = psapi.GetModuleInformation
+GetModuleInformation.restype = wintypes.BOOL
+GetModuleInformation.argtypes = [wintypes.HANDLE, wintypes.HMODULE,
+                                 ctypes.POINTER(MODULEINFO), wintypes.DWORD]
+
+GetModuleBaseNameW = psapi.GetModuleBaseNameW
+GetModuleBaseNameW.restype = wintypes.DWORD
+GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE,
+                               wintypes.LPWSTR, wintypes.DWORD]
+
 # ============================================================
 # 图标提取 (SHGetFileInfo + GDI)
 # ============================================================
@@ -484,6 +514,7 @@ class MemoryScanner:
 
     def refresh_regions(self):
         regions = []
+        writable = []
         addr = 0
         while addr < (1 << 47):
             mbi = MEMORY_BASIC_INFORMATION()
@@ -495,10 +526,14 @@ class MemoryScanner:
                 p = mbi.Protect & 0xFF
                 if p in (0x02, 0x04, 0x08, 0x20, 0x40, 0x80):
                     regions.append((mbi.BaseAddress, mbi.RegionSize))
+                # 可写区 (PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY)
+                if p in (0x04, 0x08, 0x40, 0x80):
+                    writable.append((mbi.BaseAddress, mbi.RegionSize))
             if not mbi.RegionSize:
                 break
             addr = (mbi.BaseAddress or 0) + mbi.RegionSize
         self.regions = regions
+        self.writable_regions = writable
 
     @property
     def total_bytes(self):
@@ -778,6 +813,275 @@ class MemoryScanner:
             if cur is not None:
                 self.candidates[i] = (addr, cur)
 
+    # ---------- 模块 (静态地址基准) ----------
+    def list_modules(self):
+        """枚举已加载模块 -> [(name, base, size)], 按基址升序.
+        模块范围 = 重启后基址会变但 (基址+偏移) 保持有效, 所以指针链只有
+        落到模块范围内才可复用 (CE 的 'green pointer')。"""
+        mods = []
+        if not self.handle:
+            return mods
+        cap = 1024
+        arr = (wintypes.HMODULE * cap)()
+        needed = wintypes.DWORD(0)
+        if not EnumProcessModulesEx(self.handle, arr, ctypes.sizeof(arr),
+                                    ctypes.byref(needed), LIST_MODULES_ALL):
+            return mods
+        n = min(needed.value // ctypes.sizeof(wintypes.HMODULE), cap)
+        for i in range(n):
+            h = arr[i]
+            if not h:
+                continue
+            mi = MODULEINFO()
+            if not GetModuleInformation(self.handle, h, ctypes.byref(mi),
+                                        ctypes.sizeof(mi)):
+                continue
+            buf = ctypes.create_unicode_buffer(260)
+            if not GetModuleBaseNameW(self.handle, h, buf, 260):
+                continue
+            mods.append((buf.value, int(mi.lpBaseOfDll or 0), int(mi.SizeOfImage)))
+        mods.sort(key=lambda t: t[1])
+        return mods
+
+    def module_of(self, addr, mods=None):
+        """地址归属模块 -> (name, base, offset); 不在任何模块内返回 None"""
+        for name, base, size in (mods if mods is not None else self.list_modules()):
+            if base <= addr < base + size:
+                return name, base, addr - base
+        return None
+
+    def fmt_static(self, addr, mods=None):
+        """把绝对地址格式化成 模块名+偏移 (重启后仍然有效) 或裸地址"""
+        m = self.module_of(addr, mods)
+        if m:
+            return "%s+0x%X" % (m[0], m[2])
+        return "0x%X" % addr
+
+    # ---------- 指针链扫描 ----------
+    def find_pointers_to(self, target, max_off=0, progress_cb=None, cancel_evt=None,
+                         max_hits=2000):
+        """找出所有「值落在 [target-max_off, target] 区间」的 8 字节对齐指针槽。
+
+        max_off=0 时只找精确等于 target 的槽 (C 速度的 bytes.find);
+        max_off>0 时找指向 target 之前 max_off 字节内任意位置的槽 —— 这是回溯
+        指针链的方向: 槽里的值 V 加上偏移 off = target - V 才等于目标,
+        所以 V 必然 <= target, 不能往 target 之后找。
+
+        返回 [(slot_addr, pointed_value)]。"""
+        hits = []
+        total = self.total_bytes
+        done = 0
+        pat = struct.pack("<Q", target) if max_off <= 0 else None
+        lo = target - max(0, max_off)
+        for base, rsize in self.regions:
+            if cancel_evt and cancel_evt.is_set():
+                break
+            buf = ctypes.create_string_buffer(rsize)
+            n = ctypes.c_size_t(0)
+            ok = ReadProcessMemory(self.handle, ctypes.c_void_p(base), buf, rsize,
+                                   ctypes.byref(n))
+            if ok and n.value >= 8:
+                data = buf.raw[:n.value]
+                if pat is not None:
+                    pos = 0
+                    while True:
+                        pos = data.find(pat, pos)
+                        if pos < 0:
+                            break
+                        slot = base + pos
+                        if slot % 8 == 0:      # 指针必须 8 字节对齐
+                            hits.append((slot, target))
+                            if len(hits) >= max_hits:
+                                break
+                        pos += 1
+                    if len(hits) >= max_hits:
+                        break
+                else:
+                    dlen = len(data)
+                    first = (-base) % 8
+                    for pos in range(first, dlen - 8 + 1, 8):
+                        v = struct.unpack_from("<Q", data, pos)[0]
+                        if lo <= v <= target:
+                            hits.append((base + pos, v))
+                            if len(hits) >= max_hits:
+                                break
+            done += rsize
+            if progress_cb:
+                progress_cb(done, total)
+            if len(hits) >= max_hits:
+                break
+        return hits
+
+    def pointer_scan(self, target, max_level=3, per_level=40, max_off=0x1000,
+                     progress_cb=None, cancel_evt=None):
+        """多级指针链回溯: target <- [slot] <- [slot of slot] ... 直到落到模块内。
+
+        offsets 语义 (与 resolve_chain 配套, 由外到内):
+            offsets = [off_k, ..., off_0]
+            p = 模块基址 + base_offset
+            a = *(u64*)p ;  a += offsets[0]
+            for off in offsets[1:]:  a = *(u64*)a ;  a += off
+            最后 a == target (末层不再解引用)
+
+        static=True: 链条起点在模块内, 重启后仍有效 (CE 的 green pointer)。
+        static=False: 回溯 max_level 层仍在堆内, 只能在本次运行内复用。
+        """
+        mods = self.list_modules()
+        results = []
+        seen = {target}
+        # frontier: [(goal_addr, outer_offsets)] outer_offsets 由外到内 (off_k 在前,
+        # 与 resolve_chain 的消费顺序一致)
+        frontier = [(target, [])]
+        for level in range(max_level):
+            if cancel_evt and cancel_evt.is_set():
+                break
+            if not frontier:
+                break
+            next_frontier = []
+            for goal, inner in frontier[:per_level]:
+                slots = self.find_pointers_to(goal, max_off, progress_cb, cancel_evt,
+                                              max_hits=600)
+                # 模块内的槽位优先 (直接给出可复用静态路径)
+                slots.sort(key=lambda s: (self.module_of(s[0], mods) is None, s[0]))
+                for slot, val in slots[:per_level]:
+                    off = goal - val
+                    offsets = [off] + inner
+                    m = self.module_of(slot, mods)
+                    if m:
+                        results.append({
+                            "module": m[0], "base_offset": m[2],
+                            "offsets": offsets, "hops": level + 1,
+                            "static": True, "addr": target, "slot": slot,
+                        })
+                        if len(results) >= 80:
+                            return results
+                    elif slot not in seen:
+                        seen.add(slot)
+                        next_frontier.append((slot, offsets))
+            frontier = next_frontier
+        # 未回溯到模块的堆内链也返回 (标记 static=False), 本运行内可复用
+        for goal, offsets in frontier[:20]:
+            results.append({"module": "", "base_offset": goal,
+                            "offsets": offsets, "hops": len(offsets) + 1,
+                            "static": False, "addr": target, "slot": goal})
+        # 去重 + 按「偏移越小越可能是真链」排序: 小偏移是结构体内的字段位置,
+        # 大偏移多半是堆上随机对齐的噪声。
+        uniq = []
+        seen_key = set()
+        for c in results:
+            key = (c["module"], c["base_offset"], tuple(c["offsets"]))
+            if key in seen_key:
+                continue
+            seen_key.add(key)
+            uniq.append(c)
+        uniq.sort(key=lambda c: (not c["static"], sum(abs(o) for o in c["offsets"]),
+                                 c["hops"]))
+        return uniq[:60]
+
+    def resolve_chain(self, module_name, base_offset, offsets, mods=None):
+        """按 (模块名, 基址偏移, 偏移链) 解析出最终地址 (指针链复用)。
+        偏移链语义见 pointer_scan。返回 (addr, errmsg)，失败时 addr 为 None。"""
+        if module_name:
+            mods = mods if mods is not None else self.list_modules()
+            base = None
+            for name, b, _s in mods:
+                if name.lower() == module_name.lower():
+                    base = b
+                    break
+            if base is None:
+                return None, "未找到模块 %s" % module_name
+        else:
+            base = 0
+        p = base + base_offset
+        q = self.read(p, 8)
+        if q is None:
+            return None, "指针槽 0x%X 不可读" % p
+        a = struct.unpack("<Q", q)[0]
+        if not a:
+            return None, "指针槽 0x%X 为空 (对象尚未创建)" % p
+        offsets = list(offsets or [])
+        if not offsets:
+            return a, None
+        a += offsets[0]
+        for off in offsets[1:]:
+            q = self.read(a, 8)
+            if q is None:
+                return None, "链中断: 0x%X 不可读" % a
+            a = struct.unpack("<Q", q)[0]
+            if not a:
+                return None, "链中断: 0x%X 指针为空" % a
+            a += off
+        return a, None
+
+    # ---------- 镜像 / 别名探测 (指针字段解引用) ----------
+    def find_aliases(self, addr, vtype, span=0x800, max_results=12):
+        """在 addr 附近的同一结构体内, 找所有「指针字段」, 解引用后若得到相同的值,
+        则该指针目标是真值副本 (Fusion/网络同步类游戏: 字段值是镜像, 指针指向权威值)。
+
+        返回 [{"field": 字段地址, "target": 指针目标, "hit_offset": 值在目标内的偏移,
+               "value": 值}]。"""
+        vread = self.read_value(addr, vtype)
+        if vread is None:
+            return []
+        _, _, vsize, _ = TYPE_KEY[vtype]
+        lo = (addr - span) & ~0x7
+        blk = self.read(lo, span + 0x40)
+        if blk is None:
+            lo = addr & ~0x7
+            blk = self.read(lo, 0x40)
+            if blk is None:
+                return []
+        out = []
+        seen_targets = set()
+        for pos in range(0, len(blk) - 8 + 1, 8):
+            if (lo + pos) == addr:
+                continue
+            p = struct.unpack_from("<Q", blk, pos)[0]
+            if p < 0x10000 or p >= (1 << 47) or p % 4:
+                continue
+            if p in seen_targets:
+                continue
+            tgt_blk = self.read(p, 0x80)
+            if tgt_blk is None:
+                continue
+            pat = pack_value(vtype, vread)
+            hit = tgt_blk.find(pat)
+            while hit >= 0:
+                if hit < 0x80:
+                    seen_targets.add(p)
+                    out.append({"field": lo + pos, "target": p + 0,
+                                "hit_offset": hit, "value": vread})
+                    break
+                hit = tgt_blk.find(pat, hit + 1)
+            if len(out) >= max_results:
+                break
+        return out
+
+    # ---------- 写入存活探测 (真身 / 镜像判定) ----------
+    def probe_survive(self, addrs, vtype, probe_val, delay_ms=150, cancel_evt=None):
+        """逐个写探针值 -> 等待 delay_ms -> 重读, 判定该地址是真身还是镜像/失效。
+        这是唯一能识破「写后立即读回一致、但下一帧被游戏刷回」的手段。
+        返回 [{"addr","before","after","state"}]，state ∈ live/mirror/dead。"""
+        out = []
+        data = pack_value(vtype, probe_val)
+        for a in addrs:
+            if cancel_evt and cancel_evt.is_set():
+                break
+            before = self.read_value(a, vtype)
+            wrote = self.write(a, data)
+            time.sleep(max(0.02, delay_ms / 1000.0))
+            after = self.read_value(a, vtype)
+            if after is None:
+                state = "dead"
+            elif not wrote:
+                state = "dead"
+            elif after == probe_val:
+                state = "live"
+            else:
+                state = "mirror"
+            out.append({"addr": a, "before": before, "after": after, "state": state})
+        return out
+
 
 # ============================================================
 # 模板 (已分析的游戏结构)
@@ -855,6 +1159,29 @@ def save_user_templates(tpls):
     try:
         with open(USER_TEMPLATES_PATH, "w", encoding="utf-8") as f:
             json.dump(tpls, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# 指针链存档: 模块名 + 基址偏移 + 偏移链, 重启后仍可还原
+CHAINS_PATH = os.path.join(_BASE, "pointer_chains.json")
+
+
+def load_chains():
+    try:
+        with open(CHAINS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def save_chains(rows):
+    try:
+        with open(CHAINS_PATH, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -1101,6 +1428,44 @@ class AddTemplateDialog(tk.Toplevel):
         self.on_save(self.addr, name, target, vtype)
 
 
+class ChainPicker(tk.Toplevel):
+    """选择一条已保存的指针链做还原"""
+
+    def __init__(self, parent, names, on_pick):
+        super().__init__(parent)
+        self.title("选择指针链")
+        self.geometry("520x380")
+        self.transient(parent)
+        self.grab_set()
+        try:
+            if os.path.exists(ICON_PATH):
+                self.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+        self.on_pick = on_pick
+        ttk.Label(self, text="选中一条链双击即可重解析 (游戏需已附加):",
+                  font=FONT).pack(anchor="w", padx=10, pady=8)
+        self.lb = tk.Listbox(self, font=FONT_MONO, activestyle="dotbox")
+        for n in names:
+            self.lb.insert("end", n)
+        self.lb.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.lb.bind("<Double-1>", lambda _: self._ok())
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(btns, text="还原", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=6)
+        if names:
+            self.lb.selection_set(0)
+
+    def _ok(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        self.destroy()
+        self.on_pick(i)
+
+
 class GameModderGUI:
     def __init__(self, root):
         self.root = root
@@ -1115,6 +1480,10 @@ class GameModderGUI:
         self.template_addr = None    # anchor 字段地址 (第一个)
         self.template_addrs = []     # 全部命中的 anchor 地址 (写入时全部改)
         self._proc_icon = None       # 已附加进程的图标引用
+        self.ptr_chains = []         # 指针链扫描结果
+        self.chain_rows = []         # 已保存可复用链 (落盘)
+        self.alias_rows = []         # 镜像探测结果
+        self.probe_rows = []         # 存活探测结果
 
         root.title("通用内存修改器 GameModder")
         root.geometry("1000x760")
@@ -1160,14 +1529,18 @@ class GameModderGUI:
 
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=8, pady=(4, 2))
+        self.nb = nb
         self.tab_scan = ttk.Frame(nb, padding=8)
+        self.tab_ptr = ttk.Frame(nb, padding=8)
         self.tab_tpl = ttk.Frame(nb, padding=8)
         self.tab_man = ttk.Frame(nb, padding=8)
         nb.add(self.tab_scan, text=" 数值扫描 ")
+        nb.add(self.tab_ptr, text=" 指针/穿透 ")
         nb.add(self.tab_tpl, text=" 游戏模板 ")
         nb.add(self.tab_man, text=" 手动读写 ")
 
         self._build_scan_tab()
+        self._build_ptr_tab()
         self._build_tpl_tab()
         self._build_man_tab()
 
@@ -1258,6 +1631,8 @@ class GameModderGUI:
         menu.add_command(label="写入值...", command=self.on_write_selected_dialog)
         menu.add_command(label="锁定该地址", command=self.on_lock_selected)
         menu.add_separator()
+        menu.add_command(label="追查真值 (转到 指针/穿透 页)",
+                         command=self.on_trace_real_value)
         menu.add_command(label="保存为模板...", command=self.on_save_template)
         menu.add_separator()
         menu.add_command(label="复制地址", command=self._copy_addr)
@@ -1274,6 +1649,358 @@ class GameModderGUI:
         ttk.Button(row3, text="写入全部", command=self.on_write_all).pack(side="left", padx=4)
         ttk.Button(row3, text="锁定选中", command=self.on_lock_selected).pack(side="left", padx=4)
         ttk.Button(row3, text="停止锁定", command=self.on_unlock).pack(side="left", padx=4)
+
+    # ---------- 指针/穿透页 ----------
+    def _build_ptr_tab(self):
+        f = self.tab_ptr
+
+        info = ("写入不生效的两大根因, 都在这页解决:\n"
+                "① 命中的是「缓存镜像」—— 真值在某个指针后面, 镜像每帧被游戏刷回。点 [找镜像/别名] 顺指针挖出真值。\n"
+                "② 地址每次重启都变 —— 点 [扫描指针链] 把地址回溯成 「模块名+偏移 -> 偏移链」, 重启后一键还原。")
+        ttk.Label(f, text=info, foreground="#444", font=FONT_S,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+
+        # ---- A. 镜像 / 穿透 ----
+        boxA = ttk.LabelFrame(f, text=" A. 镜像透视 & 穿透写入 ", padding=6)
+        boxA.pack(fill="x", pady=(0, 6))
+
+        rowA = ttk.Frame(boxA)
+        rowA.pack(fill="x", pady=2)
+        ttk.Label(rowA, text="目标地址:").pack(side="left")
+        self.ptr_addr = ttk.Entry(rowA, width=18, font=FONT_MONO)
+        self.ptr_addr.pack(side="left", padx=4)
+        ttk.Button(rowA, text="← 取扫描页选中", command=self.on_ptr_take_sel).pack(side="left")
+        ttk.Label(rowA, text="类型:").pack(side="left", padx=(12, 2))
+        self.ptr_type = ttk.Combobox(rowA, width=26, state="readonly", font=FONT)
+        self.ptr_type["values"] = TYPE_LABELS
+        self.ptr_type.current(0)
+        self.ptr_type.pack(side="left", padx=4)
+
+        rowA2 = ttk.Frame(boxA)
+        rowA2.pack(fill="x", pady=2)
+        ttk.Button(rowA2, text="① 找镜像/别名 (顺指针挖真值)",
+                   command=self.on_find_alias).pack(side="left")
+        ttk.Button(rowA2, text="② 存活探测 (真身 or 镜像)",
+                   command=self.on_probe).pack(side="left", padx=4)
+        ttk.Label(rowA2, text="探针值:").pack(side="left", padx=(10, 2))
+        self.ptr_probe = ttk.Entry(rowA2, width=10, font=FONT_MONO)
+        self.ptr_probe.pack(side="left", padx=4)
+        self.ptr_probe.insert(0, "123456789")
+
+        rowA3 = ttk.Frame(boxA)
+        rowA3.pack(fill="x", pady=2)
+        ttk.Label(rowA3, text="穿透写入 值:").pack(side="left")
+        self.ptr_newval = ttk.Entry(rowA3, width=14, font=FONT_MONO)
+        self.ptr_newval.pack(side="left", padx=4)
+        ttk.Button(rowA3, text="写入选中行 (含指针目标)",
+                   command=self.on_ptr_write).pack(side="left", padx=4)
+        ttk.Label(rowA3, text="(选中「镜像目标」行写入 = 穿到真值; 写镜像字段无效)",
+                  foreground="#888", font=FONT_S).pack(side="left")
+
+        colsA = ("kind", "addr", "detail")
+        self.alias_tree = ttk.Treeview(boxA, columns=colsA, show="headings", height=6)
+        self.alias_tree.heading("kind", text="性质")
+        self.alias_tree.heading("addr", text="地址 / 路径")
+        self.alias_tree.heading("detail", text="说明")
+        self.alias_tree.column("kind", width=110, anchor="w")
+        self.alias_tree.column("addr", width=250, anchor="w")
+        self.alias_tree.column("detail", width=420, anchor="w")
+        vsbA = ttk.Scrollbar(boxA, orient="vertical", command=self.alias_tree.yview)
+        self.alias_tree.configure(yscrollcommand=vsbA.set)
+        self.alias_tree.pack(side="left", fill="both", expand=True, pady=4)
+        vsbA.pack(side="left", fill="y", pady=4)
+        self.alias_tree.bind("<Double-1>", self._on_alias_dbl)
+
+        # ---- B. 指针链 ----
+        boxB = ttk.LabelFrame(f, text=" B. 指针链 (重启后仍有效的静态路径) ", padding=6)
+        boxB.pack(fill="both", expand=True)
+
+        rowB = ttk.Frame(boxB)
+        rowB.pack(fill="x", pady=2)
+        ttk.Label(rowB, text="最大层级:").pack(side="left")
+        self.ptr_level = ttk.Combobox(rowB, width=4, state="readonly", font=FONT)
+        self.ptr_level["values"] = ["2", "3", "4", "5"]
+        self.ptr_level.set("3")
+        self.ptr_level.pack(side="left", padx=4)
+        ttk.Button(rowB, text="扫描指针链 (回溯到模块)",
+                   command=self.on_scan_chain).pack(side="left", padx=4)
+        ttk.Button(rowB, text="刷新模块列表",
+                   command=self.on_list_modules).pack(side="left", padx=4)
+        ttk.Button(rowB, text="保存选中链", command=self.on_save_chain).pack(side="left", padx=4)
+        ttk.Button(rowB, text="还原链(重解析)", command=self.on_resolve_chain).pack(side="left", padx=4)
+        ttk.Label(rowB, text="(指针链每层需全内存扫, 3 层约 10~40 秒)",
+                  foreground="#888", font=FONT_S).pack(side="left", padx=6)
+
+        colsB = ("path", "value", "note")
+        self.chain_tree = ttk.Treeview(boxB, columns=colsB, show="headings", height=7)
+        self.chain_tree.heading("path", text="路径 (模块+偏移 -> 偏移链)")
+        self.chain_tree.heading("value", text="当前值")
+        self.chain_tree.heading("note", text="说明")
+        self.chain_tree.column("path", width=340, anchor="w")
+        self.chain_tree.column("value", width=130, anchor="e")
+        self.chain_tree.column("note", width=310, anchor="w")
+        vsbB = ttk.Scrollbar(boxB, orient="vertical", command=self.chain_tree.yview)
+        self.chain_tree.configure(yscrollcommand=vsbB.set)
+        self.chain_tree.pack(side="left", fill="both", expand=True, pady=4)
+        vsbB.pack(side="left", fill="y", pady=4)
+
+    # ---------- 指针页动作 ----------
+    def _ptr_vtype(self):
+        return self.get_vtype(self.ptr_type) or "double"
+
+    def _ptr_addr_val(self):
+        text = self.ptr_addr.get().strip()
+        if not text:
+            return None
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        try:
+            return int(text, 16)
+        except Exception:
+            return None
+
+    def on_ptr_take_sel(self):
+        addrs = self._selected_addrs()
+        if not addrs:
+            self.log("请先在 [数值扫描] 页选中一个地址")
+            return
+        self.ptr_addr.delete(0, "end")
+        self.ptr_addr.insert(0, "0x%X" % addrs[0])
+        if self.scanner.scan_vtype:
+            for i, t in enumerate(VALUE_TYPES):
+                if t[1] == self.scanner.scan_vtype:
+                    self.ptr_type.current(i)
+                    break
+        # 顺带把目标值填进写入框, 省一次手输
+        v = self.scanner.read_value(addrs[0], self.scanner.scan_vtype or "double")
+        if v is not None:
+            self.ptr_newval.delete(0, "end")
+            self.ptr_newval.insert(0, ("%.6g" % v) if isinstance(v, float) else str(v))
+        self.log("已取地址 0x%X (%s)" % (addrs[0], self.scanner.scan_vtype or "?"))
+
+    def on_list_modules(self):
+        if not self._require_pid():
+            return
+        mods = self.scanner.list_modules()
+        self.log("已加载模块 %d 个:" % len(mods))
+        for name, base, size in mods[:12]:
+            self.log("  %-28s base=0x%X size=0x%X" % (name, base, size))
+        if len(mods) > 12:
+            self.log("  ... 其余 %d 个" % (len(mods) - 12))
+        if not mods:
+            self.log("未取到模块 (可能需要管理员权限)")
+
+    def on_find_alias(self):
+        if not self._require_pid():
+            return
+        addr = self._ptr_addr_val()
+        if addr is None:
+            self.log("地址格式错误")
+            return
+        vtype = self._ptr_vtype()
+        v = self.scanner.read_value(addr, vtype)
+        if v is None:
+            self.log("读取 0x%X 失败" % addr)
+            return
+        self.alias_tree.delete(*self.alias_tree.get_children())
+        self.alias_rows = []
+        self.alias_tree.insert("", "end", values=(
+            "原地址", "0x%X" % addr, "当前值 = %s (%s)" % (v, vtype)))
+        aliases = self.scanner.find_aliases(addr, vtype)
+        self.alias_rows.append({"kind": "field", "addr": addr, "value": v})
+        if not aliases:
+            self.log("附近 0x800 内未发现指向同值的指针字段。"
+                     "该值可能没有指针包装 (纯值字段), 或不在同一结构体内。")
+            self.log("建议: 用「② 存活探测」判定它是不是镜像, 或用「扫描指针链」找上级指针。")
+            return
+        for a in aliases:
+            disp = "%s+0x%X" % (self.scanner.fmt_static(a["field"]),
+                                a["hit_offset"])
+            self.alias_tree.insert("", "end", values=(
+                "镜像目标(真值)",
+                "0x%X" % a["target"],
+                "指针字段 %s 指向此地址, 值在 +0x%X" % (disp, a["hit_offset"])))
+            self.alias_rows.append({"kind": "target", "addr": a["target"],
+                                   "off": a["hit_offset"], "field": a["field"],
+                                   "value": a["value"]})
+        self.log("镜像透视: 0x%X 附近发现 %d 个指向同值(%s)的指针字段 —— "
+                 "说明 0x%X 很可能只是缓存镜像, 真值在指针目标里。"
+                 "选中「镜像目标(真值)」行点 [写入选中行] 试试。" %
+                 (addr, len(aliases), v, addr))
+
+    def _on_alias_dbl(self, evt):
+        item = self.alias_tree.focus()
+        vals = self.alias_tree.item(item, "values")
+        if vals:
+            self.ptr_addr.delete(0, "end")
+            self.ptr_addr.insert(0, vals[1])
+
+    def on_probe(self):
+        if not self._require_pid():
+            return
+        addrs = self._selected_addrs()
+        addr = self._ptr_addr_val()
+        if addr is not None:
+            addrs = [addr] + [a for a in addrs if a != addr]
+        if not addrs:
+            self.log("请输入地址, 或在扫描页选中候选")
+            return
+        vtype = self._ptr_vtype()
+        try:
+            probe = self.parse_val(self.ptr_probe.get(), vtype)
+        except Exception as e:
+            self.log("探针值格式错误: %s" % e)
+            return
+        self.alias_tree.delete(*self.alias_tree.get_children())
+        self.probe_rows = []
+        rows = self.scanner.probe_survive(addrs[:20], vtype, probe)
+        n_live = n_mirror = n_dead = 0
+        for r in rows:
+            if r["state"] == "live":
+                n_live += 1
+                kind = "真身 (活)"
+                note = "写入后保持 %s —— 这就是游戏真正读的值" % probe
+            elif r["state"] == "mirror":
+                n_mirror += 1
+                kind = "镜像 (被刷回)"
+                note = "写入 %s 后变为 %s —— 下帧被游戏覆盖, 写它没用" % (probe, r["after"])
+            else:
+                n_dead += 1
+                kind = "失效"
+                note = "写入失败或读不回, 地址已失效"
+            self.alias_tree.insert("", "end", values=(
+                kind, "0x%X" % r["addr"], note))
+            self.probe_rows.append(r)
+        self.alias_rows = [{"kind": "field", "addr": r["addr"]} for r in rows]
+        self.log("存活探测: 真身 %d / 镜像 %d / 失效 %d (探针 %s, 延迟 150ms)" %
+                 (n_live, n_mirror, n_dead, probe))
+        if n_mirror and not n_live:
+            self.log("结论: 全部是镜像 —— 真值在指针后面。点 [① 找镜像/别名] 顺指针挖出来再写。")
+        elif n_live:
+            self.log("结论: 有 %d 个地址写入后存活, 直接写它就生效。" % n_live)
+
+    def on_ptr_write(self):
+        if not self._require_pid():
+            return
+        sel = self.alias_tree.selection()
+        targets = []
+        for item in sel:
+            vals = self.alias_tree.item(item, "values")
+            if len(vals) >= 2:
+                try:
+                    targets.append(int(vals[1], 16))
+                except Exception:
+                    pass
+        if not targets:
+            a = self._ptr_addr_val()
+            if a is None:
+                self.log("请选中结果行, 或填写地址")
+                return
+            targets = [a]
+        vtype = self._ptr_vtype()
+        try:
+            val = self.parse_val(self.ptr_newval.get(), vtype)
+        except Exception as e:
+            self.log("数值格式错误: %s" % e)
+            return
+        ok = 0
+        for t in targets:
+            if self.scanner.write_value(t, vtype, val):
+                ok += 1
+        self.log("穿透写入 %d/%d 处 -> %s (%s)" % (ok, len(targets), val, vtype))
+        # 写后延迟复查: 立刻读回没意义, 等 150ms 才知道有没有被刷回
+        time.sleep(0.15)
+        for t in targets:
+            after = self.scanner.read_value(t, vtype)
+            if after is None:
+                self.log("  0x%X -> 读不回" % t)
+            elif after == val:
+                self.log("  0x%X -> 保持 %s (存活)" % (t, after))
+            else:
+                self.log("  0x%X -> 被刷回 %s (镜像, 换下一个目标)" % (t, after))
+
+    def on_scan_chain(self):
+        if not self._require_pid():
+            return
+        addr = self._ptr_addr_val()
+        if addr is None:
+            self.log("地址格式错误")
+            return
+        try:
+            lvl = int(self.ptr_level.get())
+        except Exception:
+            lvl = 3
+        self.chain_tree.delete(*self.chain_tree.get_children())
+        self.ptr_chains = []
+        self.log("指针链回溯: 0x%X, 最多 %d 层 (每层全内存扫, 请稍候) ..." % (addr, lvl))
+        threading.Thread(target=self._chain_worker, args=(addr, lvl), daemon=True).start()
+
+    def _chain_worker(self, addr, lvl):
+        try:
+            chains = self.scanner.pointer_scan(addr, max_level=lvl,
+                                               per_level=40,
+                                               progress_cb=self._prog_cb,
+                                               cancel_evt=self.cancel_evt)
+        except Exception as e:
+            self.msg_queue.put(("error", "指针链扫描出错: %s" % e))
+            return
+        self.msg_queue.put(("chain_done", (addr, chains)))
+
+    def on_save_chain(self):
+        sel = self.chain_tree.selection()
+        if not sel:
+            self.log("请先选中一条指针链")
+            return
+        item = sel[0]
+        # 行号即链下标 (渲染时按 self.ptr_chains 顺序插入)
+        try:
+            idx = self.chain_tree.index(item)
+        except Exception:
+            idx = None
+        if idx is None or idx >= len(self.ptr_chains):
+            self.log("该行不对应可复用链, 请重新扫描后再选")
+            return
+        c = self.ptr_chains[idx]
+        name = "%s | %s+0x%X" % (self.scanner.name or "game", c["module"], c["base_offset"])
+        row = {"name": name, "process": self.scanner.name or "",
+               "module": c["module"], "base_offset": c["base_offset"],
+               "offsets": c["offsets"], "vtype": self._ptr_vtype()}
+        rows = load_chains()
+        rows = [r for r in rows if r.get("name") != name]
+        rows.append(row)
+        save_chains(rows)
+        self.chain_rows = rows
+        self.log("已保存指针链 [%s]: %s+0x%X -> 偏移链 %s" %
+                 (name, c["module"], c["base_offset"],
+                  " + ".join("0x%X" % o for o in c["offsets"]) or "直读"))
+        self.log("重启游戏后在本页点 [还原链(重解析)] 选它, 地址自动算回来。")
+
+    def on_resolve_chain(self):
+        if not self._require_pid():
+            return
+        rows = load_chains()
+        if not rows:
+            self.log("还没有保存过指针链。先扫描并 [保存选中链]。")
+            return
+        names = ["%s (%s)" % (r["name"], r.get("vtype", "?")) for r in rows]
+        ChainPicker(self.root, names, lambda i: self._resolve_one(rows[i]))
+
+    def _resolve_one(self, row):
+        addr, err = self.scanner.resolve_chain(row["module"], row["base_offset"],
+                                             row["offsets"])
+        if err:
+            self.log("链还原失败 [%s]: %s" % (row["name"], err))
+            return
+        vtype = row.get("vtype", "double")
+        v = self.scanner.read_value(addr, vtype)
+        self.log("链还原 [%s] -> 0x%X, 当前值 %s (%s)" %
+                 (row["name"], addr, v, vtype))
+        self.ptr_addr.delete(0, "end")
+        self.ptr_addr.insert(0, "0x%X" % addr)
+        for i, t in enumerate(VALUE_TYPES):
+            if t[1] == vtype:
+                self.ptr_type.current(i)
+                break
 
     # ---------- 模板页 ----------
     def _build_tpl_tab(self):
@@ -1684,7 +2411,10 @@ class GameModderGUI:
         return addrs
 
     def _write_addrs(self, addrs, label):
-        """写入地址列表, 返回 (成功数, 读回不一致数, 尝试总数)。失败返回 None"""
+        """写入地址列表, 返回 (成功数, 读回不一致数, 尝试总数)。失败返回 None
+
+        校验分两段: 立即读回 (只能证明写入到了内存) + 延迟 150ms 再读
+        (才能证明值没被游戏下一帧刷回去 —— 这是「写镜像无效」的唯一识别手段)。"""
         vtype = self.scanner.scan_vtype or "double"
         try:
             val = self.parse_val(self.newval.get(), vtype)
@@ -1694,10 +2424,12 @@ class GameModderGUI:
         data = pack_value(vtype, val)
         ok = 0
         mism = 0
+        written = []
         for a in addrs:
             if self.scanner.write(a, data):
                 ok += 1
-                # 写后读回校验: 地址可能被游戏重启/Unity GC 移动而失效
+                written.append(a)
+                # 立即读回: 地址可能被游戏重启/Unity GC 移动而失效
                 try:
                     rb = self.scanner.read_value(a, vtype)
                     if rb is None or rb != val:
@@ -1706,6 +2438,21 @@ class GameModderGUI:
                     pass
         self.log("已写入 %d/%d 个地址 -> %s (%s) [%s]" % (ok, len(addrs), val, vtype, label))
         total_attempt = len(addrs)
+        # 延迟复查: 判定真身 / 镜像
+        if written:
+            time.sleep(0.15)
+            flipped = []
+            for a in written:
+                rb = self.scanner.read_value(a, vtype)
+                if rb is not None and rb != val:
+                    flipped.append(a)
+            if flipped:
+                self.log("延迟复查 (150ms): %d/%d 个地址的值已被游戏刷回 —— "
+                         "这些是【镜像副本】, 写它们永远不生效。" %
+                         (len(flipped), len(written)))
+                self.log("  建议: 到 [指针/穿透] 页取该地址, 点 [① 找镜像/别名] 顺指针挖出真值再写; "
+                         "或点 [② 存活探测] 确认哪些地址是活的。")
+                mism = max(mism, len(flipped))
         if mism:
             # 写后读回不一致: 该地址多半不是真身 (游戏内存有多个副本, 只写显示/缓存副本无效)
             # 或地址已失效。候选少时自动补写其余候选, 提高命中真身概率。
@@ -1716,19 +2463,18 @@ class GameModderGUI:
                     if self.scanner.write(a, data):
                         extra_ok += 1
                 total_attempt += len(rest)
-                self.log("警告: %d 个地址写后读回不一致(可能不是真身, 游戏内存有多个副本)。"
-                         "已自动补写其余 %d 个候选(成功 %d)。回游戏确认, 若仍不生效: "
-                         "值在自动增长(挂机)就点 [锁定], 或重新定位再写" %
-                         (mism, len(rest), extra_ok))
+                self.log("警告: %d 个地址校验不一致(可能不是真身)。已自动补写其余 %d 个候选"
+                         "(成功 %d)。回游戏确认, 若仍不生效: 值在自动增长(挂机)就点 [锁定], "
+                         "或到 [指针/穿透] 页找真值" % (mism, len(rest), extra_ok))
             elif rest:
-                self.log("警告: %d 个地址写后读回不一致, 可能不是真身。候选较多(%d 个), "
+                self.log("警告: %d 个地址校验不一致, 可能不是真身。候选较多(%d 个), "
                          "请选中全部候选用 [写入全部]; 值在自动增长(挂机)就点 [锁定]" %
                          (mism, len(self.scanner.candidates)))
             else:
-                self.log("警告: 写入后读回不一致。只有 1 个候选还写不进, 通常是: "
+                self.log("警告: 写入校验不一致。若只有 1 个候选还写不进, 通常是: "
                          "① 该值在自动增长(挂机游戏)被游戏覆盖 -> 用 [锁定] 持续压值; "
                          "② 地址已失效(重启/GC 移动) -> 重新定位; "
-                         "③ 真身不止一份但扫描时其他副本不是 %s -> 用 [模板] 页定位更准" % vtype)
+                         "③ 真身不在候选里 -> 到 [指针/穿透] 页做镜像透视" % ())
         self._render_candidates()
         return ok, mism, total_attempt
 
@@ -1849,6 +2595,19 @@ class GameModderGUI:
 
     def on_refresh_display(self):
         self._render_candidates()
+
+    def on_trace_real_value(self):
+        """右键「追查真值」: 把选中地址送到指针/穿透页并立即跑镜像透视"""
+        if not self._require_pid():
+            return
+        addrs = self._selected_addrs()
+        if not addrs:
+            self.log("请先在列表中选中地址")
+            return
+        self.on_ptr_take_sel()
+        self.nb.select(self.tab_ptr)
+        self.log("已转到 [指针/穿透] 页, 正在做镜像透视 ...")
+        self.root.after(120, self.on_find_alias)
 
     # ---------- 保存为模板 (右键) ----------
     def on_save_template(self):
@@ -2164,6 +2923,47 @@ class GameModderGUI:
                             self.template_addr = None
                             self.tpl_status.configure(text="未找到, 请确认当前值", foreground="#c00")
                             self.log("模板定位失败: 未找到匹配地址")
+                    elif kind == "chain_done":
+                        target, chains = payload
+                        self.progress["value"] = 100
+                        self.ptr_chains = chains
+                        self.chain_tree.delete(*self.chain_tree.get_children())
+                        if not chains:
+                            self.log("指针链回溯: 0x%X 未找到任何引用。" % target)
+                            self.log("说明: 该地址可能没有任何指针指向 (纯值字段/栈上的临时值), "
+                                     "或偏移范围太大。可直接用「镜像透视」找真值, 或用相对地址记下。")
+                        else:
+                            n_static = 0
+                            for i, c in enumerate(chains):
+                                if c["static"]:
+                                    n_static += 1
+                                    path = "%s+0x%X  →  %s" % (
+                                        c["module"], c["base_offset"],
+                                        " + ".join("[+0x%X]" % o for o in c["offsets"]))
+                                    note = "#%d 静态链 (重启可复用)" % i
+                                else:
+                                    path = "0x%X  →  %s" % (
+                                        c["base_offset"],
+                                        " + ".join("[+0x%X]" % o for o in c["offsets"]))
+                                    note = "#%d 堆链 (仅本次运行有效)" % i
+                                addr, err = self.scanner.resolve_chain(
+                                    c["module"], c["base_offset"], c["offsets"])
+                                if addr is None:
+                                    val = "-"
+                                else:
+                                    v = self.scanner.read_value(addr, self._ptr_vtype())
+                                    val = "-" if v is None else (
+                                        "%.6g" % v if isinstance(v, float) else str(v))
+                                self.chain_tree.insert("", "end", values=(path, val, note))
+                            self.log("指针链回溯完成: 0x%X 得到 %d 条路径 "
+                                     "(其中 %d 条落在模块内, 重启后仍有效)。" %
+                                     (target, len(chains), n_static))
+                            if n_static:
+                                self.log("选中静态链行点 [保存选中链], 下次启动游戏后 "
+                                         "用 [还原链(重解析)] 一键算回地址。")
+                            else:
+                                self.log("全部是堆内链 (无静态引用): 该对象可能由 GC/容器直接持有,"
+                                         "此时靠 [游戏模板] 的结构特征定位更稳。")
                 except Exception as e:
                     # 单条消息处理异常不杀死消息泵, 记录后继续
                     self.log("消息处理异常: %s" % e)
