@@ -1617,6 +1617,13 @@ class GameModderGUI:
         self.lock_lbl = ttk.Label(top, text="", foreground="#c60", font=FONT)
         self.lock_lbl.pack(side="right", padx=8)
 
+        log_frame = ttk.LabelFrame(self.root, text=" 运行日志 ", padding=4)
+        # 先 pack 日志并锚在底部: 否则 Notebook 的 expand 会把它挤成一条标题
+        log_frame.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        self.log_box = ScrolledText(log_frame, height=6, font=("Consolas", 9),
+                                    state="disabled", background="#1e1e1e", foreground="#d4d4d4")
+        self.log_box.pack(fill="both", expand=True)
+
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=8, pady=(4, 2))
         self.nb = nb
@@ -1633,12 +1640,6 @@ class GameModderGUI:
         self._build_ptr_tab()
         self._build_tpl_tab()
         self._build_man_tab()
-
-        log_frame = ttk.LabelFrame(self.root, text=" 运行日志 ", padding=4)
-        log_frame.pack(fill="both", padx=8, pady=(0, 8))
-        self.log_box = ScrolledText(log_frame, height=8, font=("Consolas", 9),
-                                    state="disabled", background="#1e1e1e", foreground="#d4d4d4")
-        self.log_box.pack(fill="both", expand=True)
 
     # ---------- 数值扫描页 ----------
     def _build_scan_tab(self):
@@ -1659,15 +1660,18 @@ class GameModderGUI:
         ttk.Label(row1, text="(可带小数, 位数不限; 支持 1K/1M/1B/1T; 范围如 1M~1.01M)",
                   foreground="#888", font=FONT_S).pack(side="left", padx=(0, 8))
         ttk.Label(row1, text="类型:").pack(side="left")
-        self.scan_type = ttk.Combobox(row1, width=28, state="readonly", font=FONT)
+        self.scan_type = ttk.Combobox(row1, width=24, state="readonly", font=FONT)
         self.scan_type["values"] = TYPE_LABELS
         # 默认不选类型: 推荐点 [自动识别类型], 工具自动判断 double/float/int64/int32
         self.scan_type.pack(side="left", padx=4)
         self.scan_type.set("")
         ttk.Button(row1, text="自动识别类型", command=self.on_auto_detect).pack(side="left", padx=4)
-        ttk.Label(row1, text="(推荐! 四种类型自动扫一遍并推荐, 不用自己判断)", foreground="#c60",
-                  font=FONT_S).pack(side="left")
-        ttk.Label(row1, text="(首次扫描后锁定)", foreground="#999", font=FONT_S).pack(side="left")
+
+        # 提示另起一行: 挤在 row1 右侧会被窗口边缘裁掉
+        tip = ttk.Label(f, text="小贴士: 点 [自动识别类型] 会把 double / float / int64 / int32 "
+                                "各扫一遍并推荐最可能的类型, 扫完自动锁定该类型。",
+                        foreground="#c60", font=FONT_S)
+        tip.pack(anchor="w", pady=(0, 4))
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", pady=2)
@@ -1694,7 +1698,7 @@ class GameModderGUI:
         self.val_filter_entry.pack(side="left", padx=4)
         self.val_filter_entry.bind("<KeyRelease>", self._on_filter_changed)
         ttk.Button(row_f, text="清空搜索", command=self._clear_filter).pack(side="left", padx=4)
-        ttk.Label(row_f, text="(地址输片段如 0x1793; 当前值输数值, 可同时用)",
+        ttk.Label(row_f, text="← 两个框可同时用",
                   foreground="#999", font=FONT_S).pack(side="left")
         self._filter_job = None
 
@@ -1705,17 +1709,23 @@ class GameModderGUI:
         self.progress = ttk.Progressbar(f, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=4)
 
-        # 候选列表 + 右键菜单
+        # 候选列表 (左) + 写入操作区 (右侧竖排)
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True, pady=4)
+
+        tree_wrap = ttk.Frame(body)
+        tree_wrap.pack(side="left", fill="both", expand=True)
+
         cols = ("addr", "value")
-        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=12)
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=8)
         self.tree.heading("addr", text="地址 (16进制)")
         self.tree.heading("value", text="当前值")
         self.tree.column("addr", width=240, anchor="w")
         self.tree.column("value", width=210, anchor="e")
-        vsb = ttk.Scrollbar(f, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True, pady=4)
-        vsb.pack(side="left", fill="y", pady=4)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
 
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="写入值...", command=self.on_write_selected_dialog)
@@ -1730,15 +1740,18 @@ class GameModderGUI:
         self.tree_menu = menu
         self.tree.bind("<Button-3>", self._popup_menu)
 
-        row3 = ttk.Frame(f)
-        row3.pack(fill="x", pady=2)
-        ttk.Label(row3, text="修改为:").pack(side="left")
-        self.newval = ttk.Entry(row3, width=12, font=FONT_MONO)
-        self.newval.pack(side="left", padx=4)
-        ttk.Button(row3, text="写入选中", command=self.on_write_selected).pack(side="left", padx=4)
-        ttk.Button(row3, text="写入全部", command=self.on_write_all).pack(side="left", padx=4)
-        ttk.Button(row3, text="锁定选中", command=self.on_lock_selected).pack(side="left", padx=4)
-        ttk.Button(row3, text="停止锁定", command=self.on_unlock).pack(side="left", padx=4)
+        side = ttk.LabelFrame(body, text=" 写入 / 锁定 ", padding=6)
+        side.pack(side="left", fill="y", padx=(6, 0))
+        ttk.Label(side, text="修改为:").pack(anchor="w")
+        self.newval = ttk.Entry(side, width=12, font=FONT_MONO)
+        self.newval.pack(fill="x", pady=(2, 6))
+        ttk.Button(side, text="写入选中", command=self.on_write_selected).pack(fill="x", pady=2)
+        ttk.Button(side, text="写入全部", command=self.on_write_all).pack(fill="x", pady=2)
+        ttk.Separator(side, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Button(side, text="锁定选中", command=self.on_lock_selected).pack(fill="x", pady=2)
+        ttk.Button(side, text="停止锁定", command=self.on_unlock).pack(fill="x", pady=2)
+        self.lock_side_lbl = ttk.Label(side, text="未锁定", foreground="#888", font=FONT_S)
+        self.lock_side_lbl.pack(anchor="w", pady=(6, 0))
 
     # ---------- 指针/穿透页 ----------
     def _build_ptr_tab(self):
@@ -2127,33 +2140,37 @@ class GameModderGUI:
         self.tpl_hint = ttk.Label(f, text="", foreground="#888", font=FONT_S)
         self.tpl_hint.pack(anchor="w", pady=(0, 4))
 
-        cols = ("field", "offset", "value", "type")
-        self.tpl_tree = ttk.Treeview(f, columns=cols, show="headings", height=10)
-        self.tpl_tree.heading("field", text="字段")
-        self.tpl_tree.heading("offset", text="偏移")
-        self.tpl_tree.heading("value", text="当前值")
-        self.tpl_tree.heading("type", text="类型")
-        self.tpl_tree.column("field", width=220, anchor="w")
-        self.tpl_tree.column("offset", width=90, anchor="w")
-        self.tpl_tree.column("value", width=200, anchor="e")
-        self.tpl_tree.column("type", width=110, anchor="w")
-        vsb = ttk.Scrollbar(f, orient="vertical", command=self.tpl_tree.yview)
-        self.tpl_tree.configure(yscrollcommand=vsb.set)
-        self.tpl_tree.pack(side="left", fill="both", expand=True, pady=6)
-        vsb.pack(side="left", fill="y", pady=6)
-
+        # 操作行先锚在底部: tree 用 side=left+expand 会吃掉剩余空间, 后 pack 的行会被挤出窗口
         row2 = ttk.Frame(f)
-        row2.pack(fill="x", pady=2)
+        row2.pack(side="bottom", fill="x", pady=(2, 0))
         ttk.Label(row2, text="字段:").pack(side="left")
-        self.tpl_field = ttk.Combobox(row2, width=26, state="readonly", font=FONT)
+        self.tpl_field = ttk.Combobox(row2, width=22, state="readonly", font=FONT)
         self.tpl_field.pack(side="left", padx=4)
         ttk.Label(row2, text="修改为:").pack(side="left")
         self.tpl_newval = ttk.Entry(row2, width=12, font=FONT_MONO)
         self.tpl_newval.pack(side="left", padx=4)
-        ttk.Button(row2, text="写入", command=self.on_tpl_write).pack(side="left", padx=4)
-        ttk.Button(row2, text="锁定", command=self.on_tpl_lock).pack(side="left", padx=4)
-        ttk.Button(row2, text="停止锁定", command=self.on_unlock).pack(side="left", padx=4)
-        ttk.Button(row2, text="刷新显示", command=self.on_tpl_refresh).pack(side="left", padx=4)
+        ttk.Button(row2, text="写入", command=self.on_tpl_write).pack(side="left", padx=3)
+        ttk.Button(row2, text="锁定", command=self.on_tpl_lock).pack(side="left", padx=3)
+        ttk.Button(row2, text="停止锁定", command=self.on_unlock).pack(side="left", padx=3)
+        ttk.Button(row2, text="刷新显示", command=self.on_tpl_refresh).pack(side="left", padx=3)
+
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True, pady=6)
+
+        cols = ("field", "offset", "value", "type")
+        self.tpl_tree = ttk.Treeview(body, columns=cols, show="headings", height=10)
+        self.tpl_tree.heading("field", text="字段")
+        self.tpl_tree.heading("offset", text="偏移")
+        self.tpl_tree.heading("value", text="当前值")
+        self.tpl_tree.heading("type", text="类型")
+        self.tpl_tree.column("field", width=200, anchor="w")
+        self.tpl_tree.column("offset", width=90, anchor="w")
+        self.tpl_tree.column("value", width=200, anchor="e")
+        self.tpl_tree.column("type", width=110, anchor="w")
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tpl_tree.yview)
+        self.tpl_tree.configure(yscrollcommand=vsb.set)
+        self.tpl_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
 
         self._tpl_changed()   # 初始化定位目标下拉框与提示
 
@@ -2682,6 +2699,7 @@ class GameModderGUI:
         self.lock_thread = threading.Thread(target=self._lock_loop, daemon=True)
         self.lock_thread.start()
         self.lock_lbl.configure(text="锁定中 (%d 个地址)" % len(targets))
+        self.lock_side_lbl.configure(text="锁定中: %d 个" % len(targets), foreground="#080")
         self.log("已开启锁定 %d 个地址 (每 %.1fs 自动写入)" %
                  (len(targets), self.cfg.get("lock_interval", 0.3)))
 
@@ -2715,6 +2733,7 @@ class GameModderGUI:
             self.lock_thread = None
         self.lock_targets = []
         self.lock_lbl.configure(text="")
+        self.lock_side_lbl.configure(text="未锁定", foreground="#888")
 
     # ---------- 右键 ----------
     def _popup_menu(self, evt):

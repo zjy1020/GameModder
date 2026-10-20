@@ -12,6 +12,10 @@ pointer_chains.json
 # 自测临时产物
 fixture.json
 fixture_out.txt
+gui.png
+gui_*.png
+cap.py
+boot_tab.py
 
 # Python
 __pycache__/
